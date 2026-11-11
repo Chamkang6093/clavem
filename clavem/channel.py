@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import struct
 from types import TracebackType
 
@@ -42,7 +43,7 @@ class Channel:
         self._writer.close()
         try:
             await self._writer.wait_closed()
-        except (ConnectionError, TimeoutError):
+        except (ConnectionError, ssl.SSLError, TimeoutError):
             # A disconnected peer cannot acknowledge TLS shutdown.
             pass
 
