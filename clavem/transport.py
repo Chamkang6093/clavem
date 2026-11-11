@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -64,6 +65,8 @@ async def serve(
         async with Channel(reader, writer) as channel:
             if not writer.get_extra_info("ssl_object").session_reused:
                 raise ssl.SSLError("peer did not authenticate with an external PSK")
+            # Accepted sockets do not consistently inherit asyncio's TCP_NODELAY default.
+            writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             await handler(channel)
 
     async with asyncio.TaskGroup() as group:
