@@ -17,9 +17,9 @@ class Channel:
     """One reader and serialized writers on a length-prefixed byte stream."""
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._reader = reader
-        self._writer = writer
-        self._send_lock = asyncio.Lock()
+        self._reader: asyncio.StreamReader = reader
+        self._writer: asyncio.StreamWriter = writer
+        self._send_lock: asyncio.Lock = asyncio.Lock()
 
     async def send(self, message: bytes) -> None:
         """Send one message; concurrent senders cannot interleave frames."""
