@@ -108,15 +108,3 @@ the server loads no certificate and issues no session tickets, and the transport
 checks that PSK authentication was negotiated. There is no plaintext fallback.
 Clavem sets neither application idle timeouts nor connection-count limits; the
 hosting application owns those policies.
-
-## Development and release
-
-Use `uv sync` for the environment and committed `uv.lock`. Run `uv run pytest` for real
-loopback TLS regressions: normal PSK exchange, rejection of untrusted and trusted
-certificate fallback, and TCP_NODELAY checks on both peers. The publish workflow
-runs these checks before building distributions.
-
-Versions live in `pyproject.toml` and `uv.lock`. Release with a matching `vX.Y.Z`
-tag after configuring the repository's `pypi` environment and the PyPI Trusted
-Publisher. The workflow builds distributions, verifies an isolated wheel import,
-publishes to PyPI, and attaches distributions to a GitHub Release.
