@@ -47,8 +47,10 @@ asyncio.run(main())
 ```
 
 One task receives messages; multiple tasks may send, with complete frames serialized
-by the channel. Messages can be empty and are limited to 65,536 bytes. The wire
-format is a four-byte unsigned network-order length followed by that many bytes.
+by the channel. TCP_NODELAY is enabled on both peers: the client uses asyncio's
+default, and the server explicitly enables it on accepted TLS sockets. Messages
+can be empty and are limited to 65,536 bytes. The wire format is a four-byte
+unsigned network-order length followed by that many bytes.
 
 ## Serve
 
@@ -109,7 +111,10 @@ hosting application owns those policies.
 
 ## Development and release
 
-Use `uv sync` for the environment and committed `uv.lock`.
+Use `uv sync` for the environment and committed `uv.lock`. Run `uv run pytest` for real
+loopback TLS regressions: normal PSK exchange, rejection of untrusted and trusted
+certificate fallback, and TCP_NODELAY checks on both peers. The publish workflow
+runs these checks before building distributions.
 
 Versions live in `pyproject.toml` and `uv.lock`. Release with a matching `vX.Y.Z`
 tag after configuring the repository's `pypi` environment and the PyPI Trusted
