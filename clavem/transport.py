@@ -51,6 +51,7 @@ async def serve(
     keys: Mapping[str, bytes],
     handshake_timeout: float = 5,
     io_timeout: float = 30,
+    max_connections: int = 64,
 ) -> AsyncIterator[asyncio.Server]:
     """Own a listener and its handlers; cancel handlers when leaving the context.
 
@@ -60,18 +61,25 @@ async def serve(
     """
     _validate_timeout(handshake_timeout, "handshake_timeout")
     _validate_timeout(io_timeout, "io_timeout")
+    if (
+        isinstance(max_connections, bool)
+        or not isinstance(max_connections, int)
+        or max_connections < 1
+    ):
+        raise ValueError("max_connections must be a positive integer")
     context = server_context(keys)
     tasks: set[asyncio.Task[None]] = set()
 
     async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
+            await writer.start_tls(
+                context, ssl_handshake_timeout=handshake_timeout, ssl_shutdown_timeout=2
+            )
+            if not writer.get_extra_info("ssl_object").session_reused:
+                return
+            # Accepted sockets do not consistently inherit asyncio's TCP_NODELAY default.
+            writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             async with Channel(reader, writer, io_timeout=io_timeout) as channel:
-                if not writer.get_extra_info("ssl_object").session_reused:
-                    raise ssl.SSLError("peer did not authenticate with an external PSK")
-                # Accepted sockets do not consistently inherit asyncio's TCP_NODELAY default.
-                writer.get_extra_info("socket").setsockopt(
-                    socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
-                )
                 await handler(channel)
         except (
             asyncio.IncompleteReadError,
@@ -81,8 +89,16 @@ async def serve(
             TimeoutError,
         ):
             pass
+        finally:
+            # Failed/cancelled upgrades still own a raw transport, with no TLS stream to await.
+            writer.close()
 
     def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not server.is_serving() or len(tasks) >= max_connections:
+            writer.transport.abort()
+            return
+        # Do not let ClientHello enter StreamReader before start_tls takes over.
+        writer.transport.pause_reading()
         task = group.create_task(run(reader, writer))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
@@ -91,9 +107,6 @@ async def serve(
         accept,
         host,
         port,
-        ssl=context,
-        ssl_handshake_timeout=handshake_timeout,
-        ssl_shutdown_timeout=2,
         limit=MAX_MESSAGE + 4,
         start_serving=False,
     )

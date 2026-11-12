@@ -89,7 +89,7 @@ for active connections before Clavem can clean up the handlers.
 | API | Behavior |
 | --- | --- |
 | `connect(..., timeout=5, io_timeout=30)` | Bounds TCP connection and TLS authentication together; sets per-operation I/O deadlines. Returns a `Channel`. |
-| `serve(..., handshake_timeout=5, io_timeout=30)` | Bounds handshakes and channel I/O. Yields an `asyncio.Server`. |
+| `serve(..., handshake_timeout=5, io_timeout=30, max_connections=64)` | Bounds handshakes and channel I/O; caps admitted connections. Yields an `asyncio.Server`. |
 | `Channel.send(bytes)` | Checks the size before writing; the I/O deadline includes waiting for other senders and stream backpressure. |
 | `Channel.receive()` | Reads a complete frame within one I/O deadline; EOF raises `asyncio.IncompleteReadError`. |
 | `Channel.close()` | Closes the stream; supported by `async with channel`. |
@@ -112,3 +112,11 @@ receive and the entire header/body exchange. Receiving a fragment does not resta
 the deadline. Configure it on `connect()`, `serve()`, or a directly constructed
 `Channel`; applications may use an outer `asyncio.timeout()` for a shorter deadline
 covering a complete request/reply exchange.
+
+`max_connections` is a positive integer, defaulting to 64. It counts admitted
+connections from before TLS negotiation until their handshake/handler cleanup
+finishes. Excess connections are closed immediately before starting TLS, without
+adding a waiting queue or a handler task. TLS starts immediately after admission;
+application handlers only receive authenticated channels. A disconnect, failed
+handshake, timeout, or handler completion releases its slot. The operating system's
+TCP listen backlog is separate from this application connection limit.
