@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import ssl
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 
 from clavem.channel import MAX_MESSAGE, Channel, MessageTooLarge, _validate_timeout
@@ -52,7 +52,7 @@ async def serve(
     handshake_timeout: float = 5,
     io_timeout: float = 30,
     max_connections: int = 64,
-) -> AsyncIterator[asyncio.Server]:
+) -> AsyncGenerator[asyncio.Server]:
     """Own a listener and its handlers; cancel handlers when leaving the context.
 
     A handler owns one authenticated channel for its lifetime. Unexpected
