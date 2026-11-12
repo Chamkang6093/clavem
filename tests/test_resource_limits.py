@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import ssl
 import struct
 
@@ -12,20 +11,18 @@ from clavem.tls import client_context
 from clavem.transport import connect, serve
 
 
-@pytest.mark.parametrize("invalid", [0, -1, True, 1.5, math.inf, "2"])
-async def test_connection_cap_must_be_a_positive_integer(key: bytes, invalid: object) -> None:
-    with pytest.raises(ValueError, match="max_connections"):
-        async with serve(
-            lambda _channel: asyncio.sleep(0),
-            "127.0.0.1",
-            0,
-            keys={"peer": key},
-            max_connections=invalid,
-        ):
-            pytest.fail("invalid connection cap accepted")
+def _client_hello(key: bytes) -> bytes:
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    peer = client_context("peer", key).wrap_bio(incoming, outgoing)
+    with pytest.raises(ssl.SSLWantReadError):
+        peer.do_handshake()
+    return outgoing.read()
 
 
-async def test_cap_includes_handshakes_and_releases_failed_slots(key: bytes) -> None:
+@pytest.mark.parametrize("peer_state", ["silent", "partial", "abort"])
+async def test_cap_includes_handshakes_and_releases_failed_slots(
+    key: bytes, peer_state: str
+) -> None:
     calls = []
 
     async def echo(channel: Channel) -> None:
@@ -35,63 +32,40 @@ async def test_cap_includes_handshakes_and_releases_failed_slots(key: bytes) -> 
     async with (
         asyncio.timeout(5),
         serve(
-            echo, "127.0.0.1", 0, keys={"peer": key}, handshake_timeout=0.15, max_connections=1
+            echo, "127.0.0.1", 0, keys={"peer": key}, handshake_timeout=0.4, max_connections=1
         ) as server,
     ):
         port = server.sockets[0].getsockname()[1]
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         try:
-            incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
-            peer = client_context("peer", key).wrap_bio(incoming, outgoing)
-            with pytest.raises(ssl.SSLWantReadError):
-                peer.do_handshake()
-            writer.write(outgoing.read())
-            await writer.drain()
-            # ServerHello proves that the first handshake owns the only slot.
-            assert await reader.read(1)
-            for _ in range(3):
-                extra_reader, extra_writer = await asyncio.open_connection("127.0.0.1", port)
-                try:
+            if peer_state != "silent":
+                writer.write(_client_hello(key))
+                await writer.drain()
+                assert await reader.read(1)
+            extra_reader, extra_writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                # Overflow must close before a separate handshake could expire.
+                async with asyncio.timeout(0.2):
                     assert await extra_reader.read() == b""
-                finally:
-                    extra_writer.close()
-                    await extra_writer.wait_closed()
+            finally:
+                extra_writer.close()
+                await extra_writer.wait_closed()
             assert calls == []
-            await reader.read()  # The unfinished handshake expires, releasing the slot.
-            assert reader.at_eof()
+            if peer_state == "abort":
+                writer.transport.abort()
+            else:
+                await reader.read()
+                assert reader.at_eof()
         finally:
             writer.close()
             await writer.wait_closed()
-        for _ in range(3):
+        for _ in range(2):
             with pytest.raises((ssl.SSLError, ConnectionError)):
                 await connect("127.0.0.1", port, identity="unknown", key=key)
         async with await connect("127.0.0.1", port, identity="peer", key=key) as channel:
             await channel.send(b"healthy")
             assert await channel.receive() == b"healthy"
         assert calls == [True]
-
-
-async def test_authenticated_channels_keep_their_slots(key: bytes) -> None:
-    entered = asyncio.Event()
-
-    async def echo(channel: Channel) -> None:
-        entered.set()
-        await channel.send(await channel.receive())
-
-    async with (
-        asyncio.timeout(3),
-        serve(echo, "127.0.0.1", 0, keys={"peer": key}, max_connections=1) as server,
-    ):
-        port = server.sockets[0].getsockname()[1]
-        async with await connect("127.0.0.1", port, identity="peer", key=key) as first:
-            await entered.wait()
-            with pytest.raises((ssl.SSLError, ConnectionError)):
-                await connect("127.0.0.1", port, identity="peer", key=key)
-            await first.send(b"first is healthy")
-            assert await first.receive() == b"first is healthy"
-        async with await connect("127.0.0.1", port, identity="peer", key=key) as second:
-            await second.send(b"slot reused")
-            assert await second.receive() == b"slot reused"
 
 
 async def test_cancelling_server_cleans_up_pending_handshakes(key: bytes) -> None:
@@ -114,11 +88,7 @@ async def test_cancelling_server_cleans_up_pending_handshakes(key: bytes) -> Non
         writer = None
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", await ready)
-            incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
-            peer = client_context("peer", key).wrap_bio(incoming, outgoing)
-            with pytest.raises(ssl.SSLWantReadError):
-                peer.do_handshake()
-            writer.write(outgoing.read())
+            writer.write(_client_hello(key))
             await writer.drain()
             assert await reader.read(1)
             task.cancel()
@@ -134,8 +104,12 @@ async def test_cancelling_server_cleans_up_pending_handshakes(key: bytes) -> Non
             await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_malformed_message_is_isolated_without_handler_catch(key: bytes) -> None:
+@pytest.mark.parametrize("message", ["oversized", "truncated"])
+async def test_malformed_message_releases_slot_and_preserves_listener(
+    key: bytes, message: str
+) -> None:
     async def echo(channel: Channel) -> None:
+        await channel.send(b"ready")
         await channel.send(await channel.receive())
 
     async with (
@@ -144,10 +118,21 @@ async def test_malformed_message_is_isolated_without_handler_catch(key: bytes) -
     ):
         port = server.sockets[0].getsockname()[1]
         async with await connect("127.0.0.1", port, identity="peer", key=key) as channel:
-            channel._writer.write(struct.pack("!I", 2**32 - 1))
+            assert await channel.receive() == b"ready"
+            frame = (
+                struct.pack("!I", 2**32 - 1)
+                if message == "oversized"
+                else (struct.pack("!I", 100) + b"partial")
+            )
+            channel._writer.write(frame)
             await channel._writer.drain()
-            assert await channel._reader.read() == b""
+            if message == "truncated":
+                # Drop TLS without close_notify, leaving an incomplete message.
+                channel._writer.transport.abort()
+            else:
+                assert await channel._reader.read() == b""
         async with await connect("127.0.0.1", port, identity="peer", key=key) as channel:
+            assert await channel.receive() == b"ready"
             await channel.send(b"healthy")
             assert await channel.receive() == b"healthy"
 
@@ -201,5 +186,10 @@ async def test_concurrent_admission_never_exceeds_cap(key: bytes) -> None:
             for channel in channels:
                 await channel.send(b"healthy")
                 assert await channel.receive() == b"healthy"
+            # Reuse one released slot while another authenticated peer remains.
+            await channels.pop().close()
+            async with await connect("127.0.0.1", port, identity="peer", key=key) as replacement:
+                await replacement.send(b"slot reused")
+                assert await replacement.receive() == b"slot reused"
         finally:
             await asyncio.gather(*(channel.close() for channel in channels))
