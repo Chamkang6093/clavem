@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import socket
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -21,8 +22,8 @@ async def connect(
     timeout: float = 5,  # noqa: ASYNC109 - also bounds the TLS handshake.
 ) -> Channel:
     """Establish a TLS 1.3 external-PSK channel within timeout seconds."""
-    if timeout <= 0:
-        raise ValueError("timeout must be positive")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
     context = client_context(identity, key)
     async with asyncio.timeout(timeout):
         reader, writer = await asyncio.open_connection(
@@ -56,8 +57,8 @@ async def serve(
     handler errors propagate through the task group and stop the listener.
     Applications should handle expected disconnects in their handler.
     """
-    if handshake_timeout <= 0:
-        raise ValueError("handshake_timeout must be positive")
+    if not math.isfinite(handshake_timeout) or handshake_timeout <= 0:
+        raise ValueError("handshake_timeout must be finite and positive")
     context = server_context(keys)
     tasks: set[asyncio.Task[None]] = set()
 
@@ -69,26 +70,29 @@ async def serve(
             writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             await handler(channel)
 
+    def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = group.create_task(run(reader, writer))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    server = await asyncio.start_server(
+        accept,
+        host,
+        port,
+        ssl=context,
+        ssl_handshake_timeout=handshake_timeout,
+        ssl_shutdown_timeout=2,
+        limit=MAX_MESSAGE + 4,
+        start_serving=False,
+    )
     async with asyncio.TaskGroup() as group:
-
-        def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            task = group.create_task(run(reader, writer))
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-
-        server = await asyncio.start_server(
-            accept,
-            host,
-            port,
-            ssl=context,
-            ssl_handshake_timeout=handshake_timeout,
-            ssl_shutdown_timeout=2,
-            limit=MAX_MESSAGE + 4,
-        )
         try:
+            await server.start_serving()
             yield server
         finally:
             server.close()
             for task in tasks:
                 task.cancel()
+            # Include sockets that have not completed TLS and have no handler yet.
+            server.close_clients()
             await server.wait_closed()
