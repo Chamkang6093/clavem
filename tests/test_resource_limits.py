@@ -108,7 +108,12 @@ async def test_cancelling_server_cleans_up_pending_handshakes(key: bytes) -> Non
 async def test_malformed_message_releases_slot_and_preserves_listener(
     key: bytes, message: str
 ) -> None:
+    cleaned_up = asyncio.Event()
+
     async def echo(channel: Channel) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.add_done_callback(lambda _task: cleaned_up.set())
         await channel.send(b"ready")
         await channel.send(await channel.receive())
 
@@ -131,6 +136,8 @@ async def test_malformed_message_releases_slot_and_preserves_listener(
                 channel._writer.transport.abort()
             else:
                 assert await channel._reader.read() == b""
+        # Local abort completion does not imply the server has released its slot.
+        await cleaned_up.wait()
         async with await connect("127.0.0.1", port, identity="peer", key=key) as channel:
             assert await channel.receive() == b"ready"
             await channel.send(b"healthy")
