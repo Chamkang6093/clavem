@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import socket
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 
-from clavem.channel import MAX_MESSAGE, Channel
+from clavem.channel import MAX_MESSAGE, Channel, MessageTooLarge, _validate_timeout
 from clavem.tls import client_context, server_context
 
 Handler = Callable[[Channel], Awaitable[None]]
@@ -20,10 +19,11 @@ async def connect(
     identity: str,
     key: bytes,
     timeout: float = 5,  # noqa: ASYNC109 - also bounds the TLS handshake.
+    io_timeout: float = 30,
 ) -> Channel:
     """Establish a TLS 1.3 external-PSK channel within timeout seconds."""
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout must be finite and positive")
+    _validate_timeout(timeout, "timeout")
+    _validate_timeout(io_timeout, "io_timeout")
     context = client_context(identity, key)
     async with asyncio.timeout(timeout):
         reader, writer = await asyncio.open_connection(
@@ -35,7 +35,7 @@ async def connect(
             ssl_shutdown_timeout=2,
             limit=MAX_MESSAGE + 4,
         )
-    channel = Channel(reader, writer)
+    channel = Channel(reader, writer, io_timeout=io_timeout)
     if not writer.get_extra_info("ssl_object").session_reused:
         await channel.close()
         raise ssl.SSLError("peer did not authenticate with an external PSK")
@@ -50,25 +50,37 @@ async def serve(
     *,
     keys: Mapping[str, bytes],
     handshake_timeout: float = 5,
+    io_timeout: float = 30,
 ) -> AsyncIterator[asyncio.Server]:
     """Own a listener and its handlers; cancel handlers when leaving the context.
 
     A handler owns one authenticated channel for its lifetime. Unexpected
     handler errors propagate through the task group and stop the listener.
-    Applications should handle expected disconnects in their handler.
+    Expected transport errors close only the affected connection.
     """
-    if not math.isfinite(handshake_timeout) or handshake_timeout <= 0:
-        raise ValueError("handshake_timeout must be finite and positive")
+    _validate_timeout(handshake_timeout, "handshake_timeout")
+    _validate_timeout(io_timeout, "io_timeout")
     context = server_context(keys)
     tasks: set[asyncio.Task[None]] = set()
 
     async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        async with Channel(reader, writer) as channel:
-            if not writer.get_extra_info("ssl_object").session_reused:
-                raise ssl.SSLError("peer did not authenticate with an external PSK")
-            # Accepted sockets do not consistently inherit asyncio's TCP_NODELAY default.
-            writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            await handler(channel)
+        try:
+            async with Channel(reader, writer, io_timeout=io_timeout) as channel:
+                if not writer.get_extra_info("ssl_object").session_reused:
+                    raise ssl.SSLError("peer did not authenticate with an external PSK")
+                # Accepted sockets do not consistently inherit asyncio's TCP_NODELAY default.
+                writer.get_extra_info("socket").setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+                )
+                await handler(channel)
+        except (
+            asyncio.IncompleteReadError,
+            ConnectionError,
+            ssl.SSLError,
+            MessageTooLarge,
+            TimeoutError,
+        ):
+            pass
 
     def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = group.create_task(run(reader, writer))

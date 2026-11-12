@@ -28,8 +28,8 @@ Create one 32-byte random key and securely provision the same bytes on both peer
 Use a different key for unrelated services. The identity is public, not a password.
 
 ```python
-from pathlib import Path
 import asyncio
+from pathlib import Path
 
 from clavem.transport import connect
 
@@ -38,8 +38,7 @@ async def main() -> None:
     key = Path("psk.bin").read_bytes()
     async with await connect("127.0.0.1", 9443, identity="home", key=key) as channel:
         await channel.send(b"hello")
-        async with asyncio.timeout(5):
-            reply = await channel.receive()
+        reply = await channel.receive()
         print(reply)
 
 
@@ -55,27 +54,22 @@ unsigned network-order length followed by that many bytes.
 ## Serve
 
 ```python
-from pathlib import Path
 import asyncio
+from pathlib import Path
 
 from clavem.channel import Channel
 from clavem.transport import serve
 
 
 async def echo(channel: Channel) -> None:
-    try:
-        while True:
-            async with asyncio.timeout(30):
-                message = await channel.receive()
-                await channel.send(message)
-    except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
-        return
+    while True:
+        await channel.send(await channel.receive())
 
 
 async def main() -> None:
     key = Path("psk.bin").read_bytes()
-    async with serve(echo, "127.0.0.1", 9443, keys={"home": key}) as server:
-        await server.serve_forever()
+    async with serve(echo, "127.0.0.1", 9443, keys={"home": key}):
+        await asyncio.Event().wait()
 
 
 asyncio.run(main())
@@ -83,28 +77,38 @@ asyncio.run(main())
 
 `serve()` owns accepted channels and handler tasks. Returning from a handler closes
 its channel. Leaving the server context closes the listener and cancels and awaits
-remaining handlers. Handle expected peer disconnects in your handler; unexpected
+remaining handlers, including pending TLS handshakes. Peer disconnects, TLS errors,
+I/O timeouts, and oversized frames close only the affected connection. Unexpected
 handler exceptions stop the server and propagate through its task group.
+To run until cancelled, wait for an application stop signal inside this context,
+as above. Avoid awaiting the raw server's `serve_forever()`: its cancellation waits
+for active connections before Clavem can clean up the handlers.
 
 ## Contract
 
 | API | Behavior |
 | --- | --- |
-| `connect(..., timeout=5)` | Bounds TCP connection and TLS authentication together. Returns a `Channel`. |
-| `serve(..., handshake_timeout=5)` | Async context manager yielding an `asyncio.Server`. |
-| `Channel.send(bytes)` | Checks the size before writing and applies stream backpressure. |
-| `Channel.receive()` | Reads a complete frame; EOF raises `asyncio.IncompleteReadError`. |
+| `connect(..., timeout=5, io_timeout=30)` | Bounds TCP connection and TLS authentication together; sets per-operation I/O deadlines. Returns a `Channel`. |
+| `serve(..., handshake_timeout=5, io_timeout=30)` | Bounds handshakes and channel I/O. Yields an `asyncio.Server`. |
+| `Channel.send(bytes)` | Checks the size before writing; the I/O deadline includes waiting for other senders and stream backpressure. |
+| `Channel.receive()` | Reads a complete frame within one I/O deadline; EOF raises `asyncio.IncompleteReadError`. |
 | `Channel.close()` | Closes the stream; supported by `async with channel`. |
 | `client_context()` / `server_context()` | TLS contexts for applications that need lower-level asyncio integration. |
 
 An oversized incoming frame raises `clavem.channel.MessageTooLarge` and closes
 the stream. An oversized outgoing message raises the same error before writing.
-Network, TLS, and timeout exceptions retain their standard-library types. After
-cancelling or timing out an in-progress receive or send, close the channel rather
-than trying to reuse a potentially partial exchange.
+Network, TLS, and timeout exceptions retain their standard-library types at the
+channel API. A timed-out operation raises `TimeoutError`; cancelling or timing out
+a send or receive aborts the channel immediately, so a partial exchange cannot be
+reused. The `serve()` connection task handles expected peer errors as described
+above; unexpected handler exceptions propagate in an exception group.
 
 TLS contexts require external PSK authentication. The client loads no trusted CAs,
 the server loads no certificate and issues no session tickets, and the transport
 checks that PSK authentication was negotiated. There is no plaintext fallback.
-Clavem sets neither application idle timeouts nor connection-count limits; the
-hosting application owns those policies.
+Connection, handshake, and I/O timeouts must be finite and positive. `io_timeout`
+defaults to 30 seconds for each `send()` or `receive()` call, including an idle
+receive and the entire header/body exchange. Receiving a fragment does not restart
+the deadline. Configure it on `connect()`, `serve()`, or a directly constructed
+`Channel`; applications may use an outer `asyncio.timeout()` for a shorter deadline
+covering a complete request/reply exchange.
